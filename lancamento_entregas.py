@@ -14,6 +14,7 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 DATA_FILE = DATA_DIR / "entregas_produtores.xlsx"
 ORIGINAL_FILE = Path(r"C:\Users\lucassilverio\Downloads\CONTROLE DE MERCADORIAS.xlsx")
+SHEET_NAME = "Lancamentos"
 
 COLS = ["data", "produtor", "fruta", "quantidade", "destino", "origem", "observacao"]
 FRUTAS_PADRAO = ["GOIABA", "BANANA"]
@@ -180,8 +181,63 @@ def preparar_base(df: pd.DataFrame) -> pd.DataFrame:
     return base.sort_values(["data", "produtor", "destino", "fruta"], na_position="last").reset_index(drop=True)
 
 
+def google_sheets_configurado() -> bool:
+    try:
+        return bool(st.secrets.get("google_sheet_id") and st.secrets.get("gcp_service_account"))
+    except Exception:
+        return False
+
+
+def abrir_worksheet_google():
+    import gspread
+    from google.oauth2.service_account import Credentials
+
+    escopos = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    credenciais = Credentials.from_service_account_info(
+        dict(st.secrets["gcp_service_account"]),
+        scopes=escopos,
+    )
+    cliente = gspread.authorize(credenciais)
+    planilha = cliente.open_by_key(st.secrets["google_sheet_id"])
+
+    try:
+        worksheet = planilha.worksheet(SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = planilha.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(COLS))
+        worksheet.update([COLS])
+
+    valores = worksheet.get_all_values()
+    if not valores:
+        worksheet.update([COLS])
+    elif valores[0] != COLS:
+        worksheet.update("A1:G1", [COLS])
+    return worksheet
+
+
+def carregar_base_google_sheets() -> pd.DataFrame:
+    worksheet = abrir_worksheet_google()
+    registros = worksheet.get_all_records()
+    return preparar_base(pd.DataFrame(registros, columns=COLS))
+
+
+def salvar_base_google_sheets(df: pd.DataFrame) -> None:
+    worksheet = abrir_worksheet_google()
+    base = preparar_base(df)
+    dados = base.copy()
+    dados["data"] = pd.to_datetime(dados["data"], errors="coerce").dt.strftime("%Y-%m-%d")
+    dados = dados.fillna("")
+    worksheet.clear()
+    worksheet.update([COLS] + dados.astype(str).values.tolist())
+
+
 @st.cache_data(show_spinner=False)
 def carregar_base() -> pd.DataFrame:
+    if google_sheets_configurado():
+        return carregar_base_google_sheets()
+
     DATA_DIR.mkdir(exist_ok=True)
     if DATA_FILE.exists():
         return preparar_base(pd.read_excel(DATA_FILE))
@@ -193,9 +249,13 @@ def carregar_base() -> pd.DataFrame:
 
 
 def salvar_base(df: pd.DataFrame) -> None:
+    if google_sheets_configurado():
+        salvar_base_google_sheets(df)
+        return
+
     DATA_DIR.mkdir(exist_ok=True)
     with pd.ExcelWriter(DATA_FILE, engine="openpyxl") as writer:
-        preparar_base(df).to_excel(writer, index=False, sheet_name="Lancamentos")
+        preparar_base(df).to_excel(writer, index=False, sheet_name=SHEET_NAME)
 
 
 def opcoes(df: pd.DataFrame, coluna: str, extras: list[str] | None = None) -> list[str]:
@@ -412,7 +472,10 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Base")
-        st.write(f"Arquivo de dados: `{DATA_FILE.name}`")
+        if google_sheets_configurado():
+            st.success("Base compartilhada: Google Sheets")
+        else:
+            st.info(f"Base local: `{DATA_FILE.name}`")
         st.write(f"Registros salvos: **{len(base)}**")
 
     filtrado = aplicar_filtros(base)
