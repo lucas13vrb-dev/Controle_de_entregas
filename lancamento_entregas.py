@@ -15,6 +15,7 @@ DATA_DIR = APP_DIR / "data"
 DATA_FILE = DATA_DIR / "entregas_produtores.xlsx"
 ORIGINAL_FILE = Path(r"C:\Users\lucassilverio\Downloads\CONTROLE DE MERCADORIAS.xlsx")
 SHEET_NAME = "Lancamentos"
+GOOGLE_SHEET_GID_PADRAO = 448939446
 
 COLS = ["data", "produtor", "fruta", "quantidade", "destino", "origem", "observacao"]
 FRUTAS_PADRAO = ["GOIABA", "BANANA"]
@@ -32,6 +33,29 @@ def normalizar_texto(valor: object) -> str:
     texto = unicodedata.normalize("NFKD", texto)
     texto = "".join(char for char in texto if not unicodedata.combining(char))
     return re.sub(r"\s+", " ", texto).strip().upper()
+
+
+def normalizar_colunas(df: pd.DataFrame) -> pd.DataFrame:
+    aliases = {
+        "DATA": "data",
+        "PRODUTOR": "produtor",
+        "FRUTA": "fruta",
+        "QUANTIDADE": "quantidade",
+        "QTD": "quantidade",
+        "KG": "quantidade",
+        "DESTINO": "destino",
+        "DE ONDE E": "destino",
+        "ONDE": "destino",
+        "ORIGEM": "origem",
+        "OBSERVACAO": "observacao",
+        "OBS": "observacao",
+    }
+    renomear = {}
+    for coluna in df.columns:
+        chave = normalizar_texto(coluna)
+        if chave in aliases:
+            renomear[coluna] = aliases[chave]
+    return df.rename(columns=renomear)
 
 
 def parece_data(valor: object) -> bool:
@@ -164,7 +188,7 @@ def preparar_base(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=COLS)
 
-    base = df.copy()
+    base = normalizar_colunas(df.copy())
     for coluna in COLS:
         if coluna not in base.columns:
             base[coluna] = ""
@@ -188,6 +212,46 @@ def google_sheets_configurado() -> bool:
         return False
 
 
+def worksheet_tem_base_valida(worksheet) -> bool:
+    valores = worksheet.get_all_values()
+    if not valores:
+        return False
+    return encontrar_linha_cabecalho(valores) is not None
+
+
+def encontrar_linha_cabecalho(valores: list[list[str]]) -> int | None:
+    obrigatorias = {"DATA", "PRODUTOR", "FRUTA", "QUANTIDADE", "DESTINO"}
+    for indice, linha in enumerate(valores[:20]):
+        cabecalhos = {normalizar_texto(valor) for valor in linha}
+        if obrigatorias.issubset(cabecalhos):
+            return indice
+    return None
+
+
+def dataframe_do_worksheet(worksheet) -> pd.DataFrame:
+    valores = worksheet.get_all_values()
+    if not valores:
+        return pd.DataFrame(columns=COLS)
+
+    linha_cabecalho = encontrar_linha_cabecalho(valores)
+    if linha_cabecalho is None:
+        return pd.DataFrame(columns=COLS)
+
+    cabecalhos = valores[linha_cabecalho]
+    linhas = []
+    for linha in valores[linha_cabecalho + 1 :]:
+        linha_ajustada = (linha + [""] * len(cabecalhos))[: len(cabecalhos)]
+        linhas.append(linha_ajustada)
+    return pd.DataFrame(linhas, columns=cabecalhos)
+
+
+def obter_worksheet_por_gid(planilha, gid: int):
+    for worksheet in planilha.worksheets():
+        if getattr(worksheet, "id", None) == gid:
+            return worksheet
+    return None
+
+
 def abrir_worksheet_google():
     import gspread
     from google.oauth2.service_account import Credentials
@@ -203,24 +267,36 @@ def abrir_worksheet_google():
     cliente = gspread.authorize(credenciais)
     planilha = cliente.open_by_key(st.secrets["google_sheet_id"])
 
+    gid_configurado = int(st.secrets.get("google_sheet_gid", GOOGLE_SHEET_GID_PADRAO))
+    worksheet_por_gid = obter_worksheet_por_gid(planilha, gid_configurado)
+    if worksheet_por_gid is not None:
+        if not worksheet_tem_base_valida(worksheet_por_gid):
+            valores = worksheet_por_gid.get_all_values()
+            if not valores:
+                worksheet_por_gid.update([COLS])
+        return worksheet_por_gid
+
     try:
         worksheet = planilha.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
+        for candidata in planilha.worksheets():
+            if worksheet_tem_base_valida(candidata):
+                return candidata
+
         worksheet = planilha.add_worksheet(title=SHEET_NAME, rows=1000, cols=len(COLS))
         worksheet.update([COLS])
 
     valores = worksheet.get_all_values()
     if not valores:
         worksheet.update([COLS])
-    elif valores[0] != COLS:
+    elif not worksheet_tem_base_valida(worksheet):
         worksheet.update("A1:G1", [COLS])
     return worksheet
 
 
 def carregar_base_google_sheets() -> pd.DataFrame:
     worksheet = abrir_worksheet_google()
-    registros = worksheet.get_all_records()
-    return preparar_base(pd.DataFrame(registros, columns=COLS))
+    return preparar_base(dataframe_do_worksheet(worksheet))
 
 
 def salvar_base_google_sheets(df: pd.DataFrame) -> None:
@@ -397,17 +473,37 @@ def renderizar_importacao(base: pd.DataFrame) -> None:
         col1, col2 = st.columns([1, 4])
         substituir = col1.checkbox("Substituir base atual")
         if st.button("Importar arquivo", disabled=arquivo is None):
+            DATA_DIR.mkdir(exist_ok=True)
             caminho_temp = DATA_DIR / "_importacao_temp.xlsx"
-            caminho_temp.write_bytes(arquivo.getvalue())
-            importado = preparar_base(importar_planilha_original(caminho_temp))
-            caminho_temp.unlink(missing_ok=True)
-            if substituir:
-                nova_base = importado
-            else:
-                nova_base = pd.concat([base, importado], ignore_index=True)
-            salvar_base(nova_base.drop_duplicates(subset=COLS))
+            try:
+                caminho_temp.write_bytes(arquivo.getvalue())
+                importado = preparar_base(importar_planilha_original(caminho_temp))
+            except Exception as exc:
+                st.error(f"Nao foi possivel ler o arquivo enviado: {exc}")
+                return
+            finally:
+                caminho_temp.unlink(missing_ok=True)
+
+            if importado.empty:
+                st.warning(
+                    "Nenhum lancamento foi encontrado. Confira se o arquivo tem os blocos com DATA, GOIABA, BANANA e DE ONDE E."
+                )
+                return
+
+            try:
+                if substituir:
+                    nova_base = importado
+                else:
+                    nova_base = pd.concat([base, importado], ignore_index=True)
+                nova_base = nova_base.drop_duplicates(subset=COLS)
+                salvar_base(nova_base)
+            except Exception as exc:
+                st.error(f"Os dados foram lidos, mas nao foi possivel gravar na base compartilhada: {exc}")
+                return
+
             st.cache_data.clear()
-            st.success(f"{len(importado)} linhas importadas.")
+            destino_base = "Google Sheets" if google_sheets_configurado() else DATA_FILE.name
+            st.success(f"{len(importado)} linhas importadas e salvas em {destino_base}.")
             st.rerun()
 
 
